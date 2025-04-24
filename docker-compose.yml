@@ -1,0 +1,9 @@
+services:
+  hopper:
+    build: .
+    read_only: true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    volumes:
+      - ./run:/app
