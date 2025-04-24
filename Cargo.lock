@@ -303,6 +303,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf151400ff0baff5465007dd2f3e717f3fe502074ca563069ce3a6629d07b289"
 
 [[package]]
+name = "hopper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "ed25519",
+ "ed25519-dalek",
+ "rand",
+ "rustc-hash",
+ "serde",
+ "serde-env",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -614,25 +633,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core",
-]
-
-[[package]]
-name = "simpler-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chacha20poly1305",
- "ed25519",
- "ed25519-dalek",
- "rand",
- "rustc-hash",
- "serde",
- "serde-env",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "x25519-dalek",
 ]
 
 [[package]]
