@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::task::AbortOnDropHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
@@ -179,14 +179,22 @@ pub async fn start_proxying_parent(
             }
         };
 
-        write_enciphered(
+        match write_enciphered(
             &mut writer,
             &cipher,
             &mut plaintext_buffer,
             &mut nonce_buffer,
             &message,
         )
-        .await?;
+        .await
+        {
+            Result::Ok(_) => continue,
+            Err(e) => {
+                error!(?e, "failed to write to client, state will be reset");
+                true_stream_lock.take();
+                nonce_to_sender.write().await.clear();
+            }
+        }
     }
 
     Ok(())
