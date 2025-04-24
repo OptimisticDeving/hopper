@@ -40,6 +40,7 @@ struct Config {
     pub client_public_key_path: Cow<'static, str>,
     pub server_private_key_path: Cow<'static, str>,
     pub server_public_key_path: Cow<'static, str>,
+    pub do_encryption: bool,
 }
 
 impl Default for Config {
@@ -51,6 +52,7 @@ impl Default for Config {
             client_public_key_path: Cow::Borrowed("./client.pub"),
             server_private_key_path: Cow::Borrowed("./server.key"),
             server_public_key_path: Cow::Borrowed("./server.pub"),
+            do_encryption: true,
         }
     }
 }
@@ -60,6 +62,10 @@ async fn main() -> Result<()> {
     fmt().init();
 
     let config = serde_env::from_env::<Config>()?;
+
+    if !config.do_encryption {
+        warn!("encryption disabled in config, this is not supported!")
+    }
 
     let mut rng = OsRng;
     match config.proxy_server_address {
@@ -93,12 +99,20 @@ async fn main() -> Result<()> {
                 writer,
                 message_receiver,
                 cipher.clone(),
+                config.do_encryption,
             ));
 
             let nonce_to_connection = Arc::new(RwLock::new(FxHashMap::default()));
             let mut ciphertext_buffer = Cursor::new(Vec::new());
             loop {
-                match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
+                match read_enciphered_message(
+                    &mut reader,
+                    &mut ciphertext_buffer,
+                    &cipher,
+                    config.do_encryption,
+                )
+                .await?
+                {
                     Message::AddNonce(nonce) => {
                         let stream =
                             match TcpStream::connect(config.tcp_server_address.as_ref()).await {
@@ -156,7 +170,11 @@ async fn main() -> Result<()> {
             let listener = TcpListener::bind(config.tcp_server_address.as_ref()).await?;
             let (event_sender, event_receiver) = unbounded_channel();
 
-            spawn(start_proxying_parent(event_receiver, verifier));
+            spawn(start_proxying_parent(
+                event_receiver,
+                verifier,
+                config.do_encryption,
+            ));
 
             loop {
                 spawn(handle_initial_connection(

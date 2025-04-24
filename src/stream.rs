@@ -29,49 +29,59 @@ pub async fn read_enciphered_message<R: AsyncRead + Unpin>(
     mut reader: R,
     mut ciphertext_buffer: &mut Cursor<Vec<u8>>,
     cipher: &XChaCha20Poly1305,
+    do_encryption: bool,
 ) -> Result<Message> {
-    ciphertext_buffer.set_position(0);
+    if do_encryption {
+        ciphertext_buffer.set_position(0);
 
-    let crypt_nonce = read_exact::<CRYPT_NONCE_LEN, _>(&mut reader).await?;
-    let ciphertext_len = read_var_int(&mut reader).await?;
-    copy(
-        &mut ((&mut reader).take(ciphertext_len.try_into()?)),
-        &mut ciphertext_buffer,
-    )
-    .await?;
-
-    let plaintext = cipher
-        .decrypt(
-            &crypt_nonce.into(),
-            &ciphertext_buffer.get_ref()[..ciphertext_buffer.position() as usize],
+        let crypt_nonce = read_exact::<CRYPT_NONCE_LEN, _>(&mut reader).await?;
+        let ciphertext_len = read_var_int(&mut reader).await?;
+        copy(
+            &mut ((&mut reader).take(ciphertext_len.try_into()?)),
+            &mut ciphertext_buffer,
         )
-        .map_err(|e| anyhow!("{e}"))?;
+        .await?;
 
-    Message::read(&mut Cursor::new(plaintext)).await
+        let plaintext = cipher
+            .decrypt(
+                &crypt_nonce.into(),
+                &ciphertext_buffer.get_ref()[..ciphertext_buffer.position() as usize],
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        Message::read(&mut Cursor::new(plaintext)).await
+    } else {
+        Message::read(reader).await
+    }
 }
 
 #[inline]
-pub async fn write_enciphered<W: AsyncWrite + Unpin>(
+pub async fn write_packet<W: AsyncWrite + Unpin>(
     mut writer: W,
     cipher: &XChaCha20Poly1305,
     mut plaintext_buffer: &mut Cursor<Vec<u8>>,
     nonce_buffer: &mut [u8; CRYPT_NONCE_LEN],
     message: &Message,
+    do_encryption: bool,
 ) -> Result<()> {
-    plaintext_buffer.set_position(0);
-    message.write(&mut plaintext_buffer).await?;
+    if do_encryption {
+        plaintext_buffer.set_position(0);
+        message.write(&mut plaintext_buffer).await?;
 
-    thread_rng().fill_bytes(nonce_buffer);
-    writer.write_all(&*nonce_buffer).await?;
+        thread_rng().fill_bytes(nonce_buffer);
+        writer.write_all(&*nonce_buffer).await?;
 
-    let enciphered = cipher
-        .encrypt(
-            (&*nonce_buffer).into(),
-            &plaintext_buffer.get_ref()[..plaintext_buffer.position() as usize],
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-    write_var_int(&mut writer, enciphered.len().try_into()?).await?;
-    writer.write_all(&enciphered).await?;
+        let enciphered = cipher
+            .encrypt(
+                (&*nonce_buffer).into(),
+                &plaintext_buffer.get_ref()[..plaintext_buffer.position() as usize],
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        write_var_int(&mut writer, enciphered.len().try_into()?).await?;
+        writer.write_all(&enciphered).await?;
+    } else {
+        message.write(&mut writer).await?;
+    }
+
     writer.flush().await?;
 
     Ok(())

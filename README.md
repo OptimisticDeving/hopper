@@ -12,6 +12,7 @@ Minecraft reverse proxy intended for servers with encryption disabled.
 |CLIENT_PUBLIC_KEY_PATH|Path|./client.pub|Path of the client public key|
 |SERVER_PRIVATE_KEY_PATH|Path|./server.key|Path of the server private key|
 |SERVER_PUBLIC_KEY_PATH|Path|./server.pub|Path of the server public key|
+|DO_ENCRYPTION|Boolean (true/false)|true|Toggle encryption for true client/false server communication|
 
 ## Usage
 

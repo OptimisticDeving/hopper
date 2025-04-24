@@ -26,7 +26,7 @@ use crate::{
     SPECIAL_PACKET_ID,
     key::{CRYPT_NONCE_LEN, VerifierAndEncipherer},
     msg::Message,
-    stream::{read_enciphered_message, read_public_key_and_signature, write_enciphered},
+    stream::{read_enciphered_message, read_public_key_and_signature, write_packet},
     util::{read_var_int, read_var_int_with_len, split_stream_into_buffered, write_var_int},
 };
 
@@ -52,11 +52,14 @@ async fn read_from_parent(
     mut reader: BufReader<OwnedReadHalf>,
     nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
     cipher: XChaCha20Poly1305,
+    do_encryption: bool,
 ) -> Result<Infallible> {
     let mut ciphertext_buffer = Cursor::new(Vec::new());
 
     loop {
-        match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
+        match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher, do_encryption)
+            .await?
+        {
             Message::RemoveNonce(nonce) => {
                 nonce_to_sender.write().await.remove(&nonce);
             }
@@ -91,6 +94,7 @@ async fn handle_true_stream_request(
             )>,
         >,
     >,
+    do_encryption: bool,
 ) -> Result<()> {
     let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
     let public_key = PublicKey::from(&ephemeral_secret);
@@ -111,6 +115,7 @@ async fn handle_true_stream_request(
             reader,
             nonce_to_sender.clone(),
             cipher.clone(),
+            do_encryption,
         ))),
         writer,
         cipher,
@@ -123,6 +128,7 @@ async fn handle_true_stream_request(
 pub async fn start_proxying_parent(
     mut event_receiver: UnboundedReceiver<ServerConnectionEvent>,
     verifier: VerifierAndEncipherer,
+    do_encryption: bool,
 ) -> Result<()> {
     let true_stream: Arc<
         Mutex<
@@ -169,6 +175,7 @@ pub async fn start_proxying_parent(
                         nonce_to_sender.clone(),
                         verifier.clone(),
                         true_stream.clone(),
+                        do_encryption,
                     ),
                 ));
                 continue;
@@ -179,12 +186,13 @@ pub async fn start_proxying_parent(
             }
         };
 
-        match write_enciphered(
+        match write_packet(
             &mut writer,
             &cipher,
             &mut plaintext_buffer,
             &mut nonce_buffer,
             &message,
+            do_encryption,
         )
         .await
         {

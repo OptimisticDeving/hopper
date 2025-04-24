@@ -19,7 +19,7 @@ use crate::{
     SPECIAL_PACKET_ID,
     key::CRYPT_NONCE_LEN,
     msg::Message,
-    stream::write_enciphered,
+    stream::write_packet,
     util::{read_var_int, write_var_int},
 };
 
@@ -46,17 +46,19 @@ pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Message>,
     cipher: XChaCha20Poly1305,
+    do_encryption: bool,
 ) -> Result<()> {
     let mut nonce = [0u8; CRYPT_NONCE_LEN];
     let mut plaintext_buffer = Cursor::new(Vec::new());
 
     while let Some(message) = receiver.recv().await {
-        write_enciphered(
+        write_packet(
             &mut writer,
             &cipher,
             &mut plaintext_buffer,
             &mut nonce,
             &message,
+            do_encryption,
         )
         .await?;
     }
