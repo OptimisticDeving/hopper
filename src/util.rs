@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use tokio::{
+    fs::File,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::{
         TcpStream,
@@ -57,6 +60,21 @@ pub async fn write_var_int<W: AsyncWrite + Unpin>(mut writer: W, mut n: i32) -> 
     }
 
     Ok(())
+}
+
+#[inline]
+pub async fn read_exact<const N: usize, R: AsyncRead + Unpin>(mut reader: R) -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+#[inline]
+pub async fn read_exact_file<const N: usize>(path: &Path) -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    let mut file = BufReader::new(File::open(path).await?);
+    file.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 #[inline]

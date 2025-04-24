@@ -1,7 +1,8 @@
 use std::{convert::Infallible, io::Cursor, sync::Arc, time::Duration};
 
 use anyhow::{Ok, Result, bail};
-use rand::{Rng, distributions::Standard, thread_rng};
+use chacha20poly1305::XChaCha20Poly1305;
+use rand::{Rng, distributions::Standard, rngs::OsRng, thread_rng};
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, copy},
@@ -11,7 +12,7 @@ use tokio::{
     },
     select, spawn,
     sync::{
-        RwLock,
+        Mutex, RwLock,
         broadcast::{self},
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
@@ -19,10 +20,13 @@ use tokio::{
 };
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
     SPECIAL_PACKET_ID,
+    key::{CRYPT_NONCE_LEN, VerifierAndEncipherer},
     msg::Message,
+    stream::{read_enciphered_message, read_public_key_and_signature, write_enciphered},
     util::{read_var_int, read_var_int_with_len, split_stream_into_buffered, write_var_int},
 };
 
@@ -47,11 +51,12 @@ pub enum ServerConnectionEvent {
 async fn read_from_parent(
     mut reader: BufReader<OwnedReadHalf>,
     nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    cipher: XChaCha20Poly1305,
 ) -> Result<Infallible> {
-    loop {
-        let message = Message::read(&mut reader).await?;
+    let mut ciphertext_buffer = Cursor::new(Vec::new());
 
-        match message {
+    loop {
+        match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
             Message::RemoveNonce(nonce) => {
                 nonce_to_sender.write().await.remove(&nonce);
             }
@@ -72,19 +77,72 @@ async fn read_from_parent(
 }
 
 #[inline]
+async fn handle_true_stream_request(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: BufWriter<OwnedWriteHalf>,
+    nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    verifier: Arc<VerifierAndEncipherer>,
+    true_stream: Arc<
+        Mutex<
+            Option<(
+                AbortOnDropHandle<Result<Infallible>>,
+                BufWriter<OwnedWriteHalf>,
+                XChaCha20Poly1305,
+            )>,
+        >,
+    >,
+) -> Result<()> {
+    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
+    let public_key = PublicKey::from(&ephemeral_secret);
+
+    let (client_public_key, client_signature) = read_public_key_and_signature(&mut reader).await?;
+
+    let cipher = verifier.verify(&client_signature, ephemeral_secret, &client_public_key)?;
+    let signature = verifier.sign(&public_key);
+
+    writer.write_all(public_key.as_bytes()).await?;
+    writer.write_all(&signature.to_bytes()).await?;
+    writer.flush().await?;
+
+    info!("auth success, we have a new true stream!");
+    nonce_to_sender.write().await.clear();
+    *true_stream.lock().await = Some((
+        AbortOnDropHandle::new(spawn(read_from_parent(
+            reader,
+            nonce_to_sender.clone(),
+            cipher.clone(),
+        ))),
+        writer,
+        cipher,
+    ));
+
+    Ok(())
+}
+
+#[inline]
 pub async fn start_proxying_parent(
     mut event_receiver: UnboundedReceiver<ServerConnectionEvent>,
+    verifier: VerifierAndEncipherer,
 ) -> Result<()> {
-    let mut true_stream: Option<(
-        AbortOnDropHandle<Result<Infallible>>,
-        BufWriter<OwnedWriteHalf>,
-    )> = None;
+    let true_stream: Arc<
+        Mutex<
+            Option<(
+                AbortOnDropHandle<Result<Infallible>>,
+                BufWriter<OwnedWriteHalf>,
+                XChaCha20Poly1305,
+            )>,
+        >,
+    > = Arc::new(Mutex::new(None));
     let nonce_to_sender = Arc::new(RwLock::new(FxHashMap::default()));
+    let verifier = Arc::new(verifier);
+    let mut nonce_buffer = [0u8; CRYPT_NONCE_LEN];
+    let mut plaintext_buffer = Cursor::new(Vec::new());
 
     while let Some(event) = event_receiver.recv().await {
-        let (mut writer, message) = match (true_stream.as_mut(), event) {
+        let mut true_stream_lock = true_stream.lock().await;
+        let (mut writer, message, cipher) = match (true_stream_lock.as_mut(), event) {
             (
-                Some((_, writer)),
+                Some((_, writer, cipher)),
                 ServerConnectionEvent::CreateNonce {
                     nonce,
                     incoming_sender,
@@ -92,35 +150,43 @@ pub async fn start_proxying_parent(
             ) => {
                 nonce_to_sender.write().await.insert(nonce, incoming_sender);
 
-                (writer, Message::AddNonce(nonce))
+                (writer, Message::AddNonce(nonce), cipher)
             }
-            (Some((_, writer)), ServerConnectionEvent::RemoveNonce(nonce)) => {
-                (writer, Message::RemoveNonce(nonce))
+            (Some((_, writer, cipher)), ServerConnectionEvent::RemoveNonce(nonce)) => {
+                (writer, Message::RemoveNonce(nonce), cipher)
             }
-            (Some((_, writer)), ServerConnectionEvent::SendData { nonce, data }) => {
-                (writer, Message::Message { nonce, data })
+            (Some((_, writer, cipher)), ServerConnectionEvent::SendData { nonce, data }) => {
+                (writer, Message::Message { nonce, data }, cipher)
             }
             (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
-                info!("new true stream");
+                info!("new true stream request");
 
-                nonce_to_sender.write().await.clear();
-                true_stream = Some((
-                    AbortOnDropHandle::new(spawn(read_from_parent(
+                spawn(timeout(
+                    Duration::from_secs(15),
+                    handle_true_stream_request(
                         reader,
+                        writer,
                         nonce_to_sender.clone(),
-                    ))),
-                    writer,
+                        verifier.clone(),
+                        true_stream.clone(),
+                    ),
                 ));
                 continue;
             }
-            what => {
-                warn!("received event before we were ready to receive it {what:?}");
+            _ => {
+                warn!("received event before we were ready to receive it");
                 continue;
             }
         };
 
-        message.write(&mut writer).await?;
-        writer.flush().await?;
+        write_enciphered(
+            &mut writer,
+            &cipher,
+            &mut plaintext_buffer,
+            &mut nonce_buffer,
+            &message,
+        )
+        .await?;
     }
 
     Ok(())

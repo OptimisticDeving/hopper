@@ -1,6 +1,8 @@
 use std::{convert::Infallible, io::Cursor, sync::Arc};
 
 use anyhow::Result;
+use chacha20poly1305::XChaCha20Poly1305;
+use ed25519::Signature;
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy},
@@ -11,17 +13,26 @@ use tokio::{
 };
 use tokio_util::task::AbortOnDropHandle;
 use tracing::info;
+use x25519_dalek::PublicKey;
 
 use crate::{
     SPECIAL_PACKET_ID,
+    key::CRYPT_NONCE_LEN,
     msg::Message,
+    stream::write_enciphered,
     util::{read_var_int, write_var_int},
 };
 
 #[inline]
-pub async fn send_special_packet<W: AsyncWrite + Unpin>(mut writer: W) -> Result<()> {
+pub async fn send_special_packet<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    public_key: &PublicKey,
+    signature: &Signature,
+) -> Result<()> {
     let mut body = Vec::new();
     write_var_int(&mut body, SPECIAL_PACKET_ID).await?;
+    body.extend_from_slice(public_key.as_bytes());
+    body.extend_from_slice(&signature.to_bytes());
 
     write_var_int(&mut writer, body.len().try_into()?).await?;
     copy(&mut Cursor::new(&mut body), &mut writer).await?;
@@ -34,10 +45,20 @@ pub async fn send_special_packet<W: AsyncWrite + Unpin>(mut writer: W) -> Result
 pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Message>,
+    cipher: XChaCha20Poly1305,
 ) -> Result<()> {
+    let mut nonce = [0u8; CRYPT_NONCE_LEN];
+    let mut plaintext_buffer = Cursor::new(Vec::new());
+
     while let Some(message) = receiver.recv().await {
-        message.write(&mut writer).await?;
-        writer.flush().await?;
+        write_enciphered(
+            &mut writer,
+            &cipher,
+            &mut plaintext_buffer,
+            &mut nonce,
+            &message,
+        )
+        .await?;
     }
 
     Ok(())
