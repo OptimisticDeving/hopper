@@ -13,6 +13,7 @@ tokio = { version = "1.44", features = [
     "sync",
     "parking_lot",
     "fs",
+    "signal",
 ] }
 tokio-util = { version = "0.7", features = ["rt"] }
 

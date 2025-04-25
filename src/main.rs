@@ -6,7 +6,7 @@ mod msg;
 mod server_stream;
 mod stream;
 mod util;
-use std::{borrow::Cow, io::Cursor, path::Path, sync::Arc};
+use std::{borrow::Cow, io::Cursor, net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::Result;
 use client_stream::{
@@ -23,6 +23,11 @@ use tokio::{
     io::AsyncWriteExt,
     main,
     net::{TcpListener, TcpStream},
+    select,
+    signal::{
+        ctrl_c,
+        unix::{SignalKind, signal},
+    },
     spawn,
     sync::{RwLock, mpsc::unbounded_channel},
 };
@@ -60,6 +65,16 @@ impl Default for Config {
     }
 }
 
+enum ClientWakeEvent {
+    Message(Message),
+    Terminate,
+}
+
+enum ServerWakeEvent {
+    Connection((TcpStream, SocketAddr)),
+    Terminate,
+}
+
 #[main]
 async fn main() -> Result<()> {
     fmt().init();
@@ -71,6 +86,8 @@ async fn main() -> Result<()> {
     }
 
     let mut rng = OsRng;
+    let mut sigint = signal(SignalKind::terminate())?;
+
     match config.proxy_server_address {
         Some(proxy_server_address) => {
             let verifier = VerifierAndEncipherer::generate(
@@ -125,10 +142,26 @@ async fn main() -> Result<()> {
             let nonce_to_connection = Arc::new(RwLock::new(FxHashMap::default()));
             let mut ciphertext_buffer = Cursor::new(Vec::new());
             loop {
-                match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
-                    Message::AddNonce(nonce) => {
-                        let stream =
-                            match TcpStream::connect(config.tcp_server_address.as_ref()).await {
+                let event = select! {
+                    message = read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher) => {
+                        ClientWakeEvent::Message(message?)
+                    },
+                    _ = sigint.recv() => {
+                        ClientWakeEvent::Terminate
+                    },
+                    _ = ctrl_c() => {
+                        ClientWakeEvent::Terminate
+                    }
+                };
+
+                match event {
+                    ClientWakeEvent::Message(message) => match message {
+                        Message::AddNonce(nonce) => {
+                            let stream = match TcpStream::connect(
+                                config.tcp_server_address.as_ref(),
+                            )
+                            .await
+                            {
                                 Ok(stream) => stream,
                                 Err(e) => {
                                     warn!(?e, "failed to connect to the true server");
@@ -137,34 +170,39 @@ async fn main() -> Result<()> {
                                 }
                             };
 
-                        stream.set_nodelay(true)?;
-                        let (reader, writer) = split_stream_into_buffered(stream);
-                        let (write_sender, write_receiver) = unbounded_channel();
-                        spawn(handle_write(writer, write_receiver));
+                            stream.set_nodelay(true)?;
+                            let (reader, writer) = split_stream_into_buffered(stream);
+                            let (write_sender, write_receiver) = unbounded_channel();
+                            spawn(handle_write(writer, write_receiver));
 
-                        nonce_to_connection.write().await.insert(
-                            nonce,
-                            (
-                                AbortOnDropHandle::new(spawn(handle_mc_proxy_read(
-                                    reader,
-                                    nonce,
-                                    message_sender.clone(),
-                                    nonce_to_connection.clone(),
-                                ))),
-                                write_sender,
-                            ),
-                        );
-                    }
-                    Message::RemoveNonce(nonce) => {
-                        nonce_to_connection.write().await.remove(&nonce);
-                    }
-                    Message::Message { nonce, data } => {
-                        let read = nonce_to_connection.read().await;
-                        let Some((_, write_sender)) = read.get(&nonce) else {
-                            continue;
-                        };
+                            nonce_to_connection.write().await.insert(
+                                nonce,
+                                (
+                                    AbortOnDropHandle::new(spawn(handle_mc_proxy_read(
+                                        reader,
+                                        nonce,
+                                        message_sender.clone(),
+                                        nonce_to_connection.clone(),
+                                    ))),
+                                    write_sender,
+                                ),
+                            );
+                        }
+                        Message::RemoveNonce(nonce) => {
+                            nonce_to_connection.write().await.remove(&nonce);
+                        }
+                        Message::Message { nonce, data } => {
+                            let read = nonce_to_connection.read().await;
+                            let Some((_, write_sender)) = read.get(&nonce) else {
+                                continue;
+                            };
 
-                        write_sender.send(data)?;
+                            write_sender.send(data)?;
+                        }
+                    },
+                    ClientWakeEvent::Terminate => {
+                        info!("received termination signal");
+                        break;
                     }
                 }
             }
@@ -191,11 +229,30 @@ async fn main() -> Result<()> {
             ));
 
             loop {
-                spawn(handle_initial_connection(
-                    listener.accept().await?.0,
-                    event_sender.clone(),
-                ));
+                let event = select! {
+                    conn = listener.accept() => {
+                        ServerWakeEvent::Connection(conn?)
+                    }
+                    _ = sigint.recv() => {
+                        ServerWakeEvent::Terminate
+                    },
+                    _ = ctrl_c() => {
+                        ServerWakeEvent::Terminate
+                    }
+                };
+
+                match event {
+                    ServerWakeEvent::Connection((stream, _)) => {
+                        spawn(handle_initial_connection(stream, event_sender.clone()));
+                    }
+                    ServerWakeEvent::Terminate => {
+                        info!("received termination signal");
+                        break;
+                    }
+                }
             }
         }
     }
+
+    Ok(())
 }
