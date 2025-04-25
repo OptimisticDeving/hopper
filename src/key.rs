@@ -12,19 +12,39 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::util::read_exact_file;
 
 pub const CRYPT_NONCE_LEN: usize = 24;
+pub const SIGN_MESSAGE_SIZE: usize = (8 * 2) + (32 * 2);
 
 pub struct VerifierAndEncipherer {
     pub our_ed25519: SigningKey,
     pub their_ed25519: VerifyingKey,
+    pub is_client: bool,
 }
 
 impl VerifierAndEncipherer {
+    #[inline]
+    pub fn create_message(
+        client_nonce: u64,
+        server_nonce: u64,
+        client_public_key: &PublicKey,
+        server_public_key: &PublicKey,
+    ) -> [u8; SIGN_MESSAGE_SIZE] {
+        let mut message = [0u8; SIGN_MESSAGE_SIZE];
+
+        message[0..8].copy_from_slice(&client_nonce.to_be_bytes());
+        message[8..16].copy_from_slice(&server_nonce.to_be_bytes());
+        message[16..48].copy_from_slice(client_public_key.as_bytes());
+        message[48..].copy_from_slice(server_public_key.as_bytes());
+
+        message
+    }
+
     #[inline]
     pub async fn generate(
         our_key: &Path,
         our_public_key: &Path,
         peer_key: &Path,
         rng: &mut OsRng,
+        is_client: bool,
     ) -> Result<Self> {
         let signing_key = if !try_exists(our_key).await? {
             info!("couldn't find private key, generating now");
@@ -46,25 +66,53 @@ impl VerifierAndEncipherer {
         Ok(Self {
             our_ed25519: signing_key,
             their_ed25519: verifying_key,
+            is_client,
         })
     }
 
     #[inline]
-    pub fn verify(
+    pub fn peer_verify(
         &self,
         signature: &Signature,
         our_secret: EphemeralSecret,
-        public_key: &PublicKey,
+        client_nonce: u64,
+        server_nonce: u64,
+        client_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<XChaCha20Poly1305> {
-        self.their_ed25519
-            .verify_strict(public_key.as_bytes(), &signature)?;
+        let message = Self::create_message(
+            client_nonce,
+            server_nonce,
+            client_public_key,
+            server_public_key,
+        );
+
+        self.their_ed25519.verify_strict(&message, &signature)?;
         Ok(XChaCha20Poly1305::new(
-            our_secret.diffie_hellman(public_key).as_bytes().into(),
+            our_secret
+                .diffie_hellman(if self.is_client {
+                    server_public_key
+                } else {
+                    client_public_key
+                })
+                .as_bytes()
+                .into(),
         ))
     }
 
     #[inline]
-    pub fn sign(&self, public_key: &PublicKey) -> Signature {
-        self.our_ed25519.clone().sign(public_key.as_bytes())
+    pub fn sign_and_verify(
+        &self,
+        client_nonce: u64,
+        server_nonce: u64,
+        client_public_key: &PublicKey,
+        server_public_key: &PublicKey,
+    ) -> Result<Signature> {
+        Ok(self.our_ed25519.clone().sign(&Self::create_message(
+            client_nonce,
+            server_nonce,
+            client_public_key,
+            server_public_key,
+        )))
     }
 }

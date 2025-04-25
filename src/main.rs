@@ -1,3 +1,5 @@
+#![feature(result_flattening)]
+
 mod client_stream;
 mod key;
 mod msg;
@@ -16,8 +18,9 @@ use rand::rngs::OsRng;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use server_stream::{handle_initial_connection, start_proxying_parent};
-use stream::{read_enciphered_message, read_public_key_and_signature};
+use stream::{read_enciphered_message, read_public_key_and_nonce};
 use tokio::{
+    io::AsyncWriteExt,
     main,
     net::{TcpListener, TcpStream},
     spawn,
@@ -26,7 +29,7 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
-use util::split_stream_into_buffered;
+use util::{read_signature, split_stream_into_buffered};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 pub const SPECIAL_PACKET_ID: i32 = 0xDEADBEEFu32.cast_signed();
@@ -75,6 +78,7 @@ async fn main() -> Result<()> {
                 Path::new(config.client_public_key_path.as_ref()),
                 Path::new(config.server_public_key_path.as_ref()),
                 &mut rng,
+                true,
             )
             .await?;
 
@@ -84,15 +88,31 @@ async fn main() -> Result<()> {
             let (mut reader, mut writer) = split_stream_into_buffered(stream);
 
             let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
-            let public_key = PublicKey::from(&ephemeral_secret);
-            let signature = verifier.sign(&public_key);
-            send_special_packet(&mut writer, &public_key, &signature).await?;
+            let client_public_key = PublicKey::from(&ephemeral_secret);
+            let client_nonce = send_special_packet(&mut writer, &client_public_key).await?;
 
-            let (server_public_key, server_signature) =
-                read_public_key_and_signature(&mut reader).await?;
+            let (server_public_key, server_nonce) = read_public_key_and_nonce(&mut reader).await?;
 
-            let cipher =
-                verifier.verify(&server_signature, ephemeral_secret, &server_public_key)?;
+            let client_signature = verifier.sign_and_verify(
+                client_nonce,
+                server_nonce,
+                &client_public_key,
+                &server_public_key,
+            )?;
+
+            writer.write_all(&client_signature.to_bytes()).await?;
+            writer.flush().await?;
+
+            let server_signature = read_signature(&mut reader).await?;
+
+            let cipher = verifier.peer_verify(
+                &server_signature,
+                ephemeral_secret,
+                client_nonce,
+                server_nonce,
+                &client_public_key,
+                &server_public_key,
+            )?;
 
             let (message_sender, message_receiver) = unbounded_channel();
             spawn(start_writing_messages(
@@ -164,6 +184,7 @@ async fn main() -> Result<()> {
                 Path::new(config.server_public_key_path.as_ref()),
                 Path::new(config.client_public_key_path.as_ref()),
                 &mut rng,
+                false,
             )
             .await?;
 

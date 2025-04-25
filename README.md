@@ -37,10 +37,12 @@ Minecraft reverse proxy intended for servers with encryption disabled.
 ### True Client Establishment
 1. Server binds on TCP_SERVER_ADDRESS
 2. Client connects to server specified by PROXY_SERVER_ADDRESS
-3. Client sends a packet with ID 0xDEADBEEF (but signed), with the body being a random X25519 public key and an ED25519 signature of said public key signed with the private of its ED25519 keypair. Note that the length of this packet is ignored, as we don't need it, but the body must still be present.
-4. After this point, we will be conversing using our simpler packet format instead of the Minecraft one.
-5. Server verifies that the signature is correct and then generates its own X25519 public key and signs that public key with its private key and sends the X25519 public key & signature to the client.
-6. If the key exchange is successful, this connection becomes the "true client" and all other previously connected clients are disconnected (incl. the previous true client), and further packets will be encrypted with XChaCha20Poly1305.
+3. Client sends a packet with ID 0xDEADBEEF (but signed), with the body being a random X25519 public key and a random nonce.
+4. Server sends its nonce, along with an Ed25519 signature of both the client & server X25519 public keys and both the client and server nonces.
+5. Client sends a signature of the same data.
+6. Both the client & server verify the signatures. If verification fails, the verifying party will disconnect.
+7. After this point, we will be conversing using our simpler packet format instead of the Minecraft one.
+8. If the key exchange is successful, this connection becomes the "true client" and all other previously connected clients are disconnected (incl. the previous true client), and further packets will be encrypted with XChaCha20Poly1305.
 
 ### False Client Establishment
 

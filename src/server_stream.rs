@@ -26,8 +26,14 @@ use crate::{
     SPECIAL_PACKET_ID,
     key::{CRYPT_NONCE_LEN, VerifierAndEncipherer},
     msg::Message,
-    stream::{read_enciphered_message, read_public_key_and_signature, write_packet},
-    util::{read_var_int, read_var_int_with_len, split_stream_into_buffered, write_var_int},
+    stream::{
+        read_enciphered_message, read_public_key_and_nonce, write_packet,
+        write_public_key_and_nonce,
+    },
+    util::{
+        read_signature, read_var_int, read_var_int_with_len, split_stream_into_buffered,
+        write_var_int,
+    },
 };
 
 #[derive(Debug)]
@@ -97,16 +103,29 @@ async fn handle_true_stream_request(
     do_encryption: bool,
 ) -> Result<()> {
     let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
-    let public_key = PublicKey::from(&ephemeral_secret);
+    let server_public_key = PublicKey::from(&ephemeral_secret);
 
-    let (client_public_key, client_signature) = read_public_key_and_signature(&mut reader).await?;
-
-    let cipher = verifier.verify(&client_signature, ephemeral_secret, &client_public_key)?;
-    let signature = verifier.sign(&public_key);
-
-    writer.write_all(public_key.as_bytes()).await?;
-    writer.write_all(&signature.to_bytes()).await?;
+    let (client_public_key, client_timestamp) = read_public_key_and_nonce(&mut reader).await?;
+    let server_timestamp = write_public_key_and_nonce(&mut writer, &server_public_key).await?;
+    let server_signature = verifier.sign_and_verify(
+        client_timestamp,
+        server_timestamp,
+        &client_public_key,
+        &server_public_key,
+    )?;
+    writer.write_all(&server_signature.to_bytes()).await?;
     writer.flush().await?;
+
+    let client_signature = read_signature(&mut reader).await?;
+
+    let cipher = verifier.peer_verify(
+        &client_signature,
+        ephemeral_secret,
+        client_timestamp,
+        server_timestamp,
+        &client_public_key,
+        &server_public_key,
+    )?;
 
     info!("auth success, we have a new true stream!");
     nonce_to_sender.write().await.clear();
@@ -167,21 +186,35 @@ pub async fn start_proxying_parent(
             (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
                 info!("new true stream request");
 
-                spawn(timeout(
-                    Duration::from_secs(15),
-                    handle_true_stream_request(
-                        reader,
-                        writer,
-                        nonce_to_sender.clone(),
-                        verifier.clone(),
-                        true_stream.clone(),
-                        do_encryption,
-                    ),
-                ));
+                let (nonce_to_sender, verifier, true_stream) = (
+                    nonce_to_sender.clone(),
+                    verifier.clone(),
+                    true_stream.clone(),
+                );
+                spawn(async move {
+                    match timeout(
+                        Duration::from_secs(15),
+                        handle_true_stream_request(
+                            reader,
+                            writer,
+                            nonce_to_sender,
+                            verifier,
+                            true_stream,
+                            do_encryption,
+                        ),
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .flatten()
+                    {
+                        Result::Ok(_) => {}
+                        Err(e) => warn!(?e, "auth failure"),
+                    }
+                });
                 continue;
             }
-            _ => {
-                warn!("received event before we were ready to receive it");
+            (_, event) => {
+                warn!("received event with invalid order/side: {event:?}");
                 continue;
             }
         };

@@ -2,9 +2,8 @@ use std::io::Cursor;
 
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{XChaCha20Poly1305, aead::Aead};
-use ed25519::Signature;
-use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
-use rand::{RngCore, thread_rng};
+use ed25519_dalek::PUBLIC_KEY_LENGTH;
+use rand::{Rng, RngCore, distributions::Standard, rngs::OsRng, thread_rng};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy};
 use x25519_dalek::PublicKey;
 
@@ -15,12 +14,12 @@ use crate::{
 };
 
 #[inline]
-pub async fn read_public_key_and_signature<R: AsyncRead + Unpin>(
+pub async fn read_public_key_and_nonce<R: AsyncRead + Unpin>(
     mut reader: R,
-) -> Result<(PublicKey, Signature)> {
+) -> Result<(PublicKey, u64)> {
     Ok((
         PublicKey::from(read_exact::<PUBLIC_KEY_LENGTH, _>(&mut reader).await?),
-        Signature::from_bytes(&read_exact::<SIGNATURE_LENGTH, _>(&mut reader).await?),
+        reader.read_u64().await?,
     ))
 }
 
@@ -85,4 +84,16 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
     writer.flush().await?;
 
     Ok(())
+}
+
+#[inline]
+pub async fn write_public_key_and_nonce<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    public_key: &PublicKey,
+) -> Result<u64> {
+    writer.write_all(public_key.as_bytes()).await?;
+
+    let nonce: u64 = OsRng.sample(Standard);
+    writer.write_all(&nonce.to_be_bytes()).await?;
+    Ok(nonce)
 }

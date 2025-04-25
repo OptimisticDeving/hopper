@@ -2,7 +2,6 @@ use std::{convert::Infallible, io::Cursor, sync::Arc};
 
 use anyhow::Result;
 use chacha20poly1305::XChaCha20Poly1305;
-use ed25519::Signature;
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy},
@@ -19,7 +18,7 @@ use crate::{
     SPECIAL_PACKET_ID,
     key::CRYPT_NONCE_LEN,
     msg::Message,
-    stream::write_packet,
+    stream::{write_packet, write_public_key_and_nonce},
     util::{read_var_int, write_var_int},
 };
 
@@ -27,18 +26,16 @@ use crate::{
 pub async fn send_special_packet<W: AsyncWrite + Unpin>(
     mut writer: W,
     public_key: &PublicKey,
-    signature: &Signature,
-) -> Result<()> {
+) -> Result<u64> {
     let mut body = Vec::new();
     write_var_int(&mut body, SPECIAL_PACKET_ID).await?;
-    body.extend_from_slice(public_key.as_bytes());
-    body.extend_from_slice(&signature.to_bytes());
+    let timestamp = write_public_key_and_nonce(&mut body, public_key).await?;
 
     write_var_int(&mut writer, body.len().try_into()?).await?;
     copy(&mut Cursor::new(&mut body), &mut writer).await?;
     writer.flush().await?;
 
-    Ok(())
+    Ok(timestamp)
 }
 
 #[inline]

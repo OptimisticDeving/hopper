@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use ed25519::Signature;
 use tokio::{
     fs::File,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
@@ -75,6 +76,11 @@ pub async fn read_exact_file<const N: usize>(path: &Path) -> Result<[u8; N]> {
     let mut file = BufReader::new(File::open(path).await?);
     file.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[inline]
+pub async fn read_signature<R: AsyncRead + Unpin>(mut reader: R) -> Result<Signature> {
+    Ok(Signature::from_bytes(&read_exact(&mut reader).await?))
 }
 
 #[inline]
