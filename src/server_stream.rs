@@ -57,15 +57,12 @@ pub enum ServerConnectionEvent {
 async fn read_from_parent(
     mut reader: BufReader<OwnedReadHalf>,
     nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
-    cipher: XChaCha20Poly1305,
-    do_encryption: bool,
+    cipher: Option<XChaCha20Poly1305>,
 ) -> Result<Infallible> {
     let mut ciphertext_buffer = Cursor::new(Vec::new());
 
     loop {
-        match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher, do_encryption)
-            .await?
-        {
+        match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
             Message::RemoveNonce(nonce) => {
                 nonce_to_sender.write().await.remove(&nonce);
             }
@@ -85,21 +82,19 @@ async fn read_from_parent(
     }
 }
 
+pub struct TrueStream {
+    pub _reader_task_drop_guard: AbortOnDropHandle<Result<Infallible>>,
+    pub writer: BufWriter<OwnedWriteHalf>,
+    pub cipher: Option<XChaCha20Poly1305>,
+}
+
 #[inline]
 async fn handle_true_stream_request(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: BufWriter<OwnedWriteHalf>,
     nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
     verifier: Arc<VerifierAndEncipherer>,
-    true_stream: Arc<
-        Mutex<
-            Option<(
-                AbortOnDropHandle<Result<Infallible>>,
-                BufWriter<OwnedWriteHalf>,
-                XChaCha20Poly1305,
-            )>,
-        >,
-    >,
+    true_stream: Arc<Mutex<Option<TrueStream>>>,
     do_encryption: bool,
 ) -> Result<()> {
     let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
@@ -125,20 +120,20 @@ async fn handle_true_stream_request(
         server_timestamp,
         &client_public_key,
         &server_public_key,
+        do_encryption,
     )?;
 
     info!("auth success, we have a new true stream!");
     nonce_to_sender.write().await.clear();
-    *true_stream.lock().await = Some((
-        AbortOnDropHandle::new(spawn(read_from_parent(
+    *true_stream.lock().await = Some(TrueStream {
+        _reader_task_drop_guard: AbortOnDropHandle::new(spawn(read_from_parent(
             reader,
             nonce_to_sender.clone(),
             cipher.clone(),
-            do_encryption,
         ))),
         writer,
         cipher,
-    ));
+    });
 
     Ok(())
 }
@@ -149,15 +144,7 @@ pub async fn start_proxying_parent(
     verifier: VerifierAndEncipherer,
     do_encryption: bool,
 ) -> Result<()> {
-    let true_stream: Arc<
-        Mutex<
-            Option<(
-                AbortOnDropHandle<Result<Infallible>>,
-                BufWriter<OwnedWriteHalf>,
-                XChaCha20Poly1305,
-            )>,
-        >,
-    > = Arc::new(Mutex::new(None));
+    let true_stream: Arc<Mutex<Option<TrueStream>>> = Arc::new(Mutex::new(None));
     let nonce_to_sender = Arc::new(RwLock::new(FxHashMap::default()));
     let verifier = Arc::new(verifier);
     let mut nonce_buffer = [0u8; CRYPT_NONCE_LEN];
@@ -165,9 +152,9 @@ pub async fn start_proxying_parent(
 
     while let Some(event) = event_receiver.recv().await {
         let mut true_stream_lock = true_stream.lock().await;
-        let (mut writer, message, cipher) = match (true_stream_lock.as_mut(), event) {
+        let (true_stream, message) = match (true_stream_lock.as_mut(), event) {
             (
-                Some((_, writer, cipher)),
+                Some(true_stream),
                 ServerConnectionEvent::CreateNonce {
                     nonce,
                     incoming_sender,
@@ -175,13 +162,13 @@ pub async fn start_proxying_parent(
             ) => {
                 nonce_to_sender.write().await.insert(nonce, incoming_sender);
 
-                (writer, Message::AddNonce(nonce), cipher)
+                (true_stream, Message::AddNonce(nonce))
             }
-            (Some((_, writer, cipher)), ServerConnectionEvent::RemoveNonce(nonce)) => {
-                (writer, Message::RemoveNonce(nonce), cipher)
+            (Some(true_stream), ServerConnectionEvent::RemoveNonce(nonce)) => {
+                (true_stream, Message::RemoveNonce(nonce))
             }
-            (Some((_, writer, cipher)), ServerConnectionEvent::SendData { nonce, data }) => {
-                (writer, Message::Message { nonce, data }, cipher)
+            (Some(true_stream), ServerConnectionEvent::SendData { nonce, data }) => {
+                (true_stream, Message::Message { nonce, data })
             }
             (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
                 info!("new true stream request");
@@ -220,12 +207,11 @@ pub async fn start_proxying_parent(
         };
 
         match write_packet(
-            &mut writer,
-            &cipher,
+            &mut true_stream.writer,
+            &true_stream.cipher,
             &mut plaintext_buffer,
             &mut nonce_buffer,
             &message,
-            do_encryption,
         )
         .await
         {

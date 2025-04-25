@@ -42,8 +42,7 @@ pub async fn send_special_packet<W: AsyncWrite + Unpin>(
 pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Message>,
-    cipher: XChaCha20Poly1305,
-    do_encryption: bool,
+    cipher: Option<XChaCha20Poly1305>,
 ) -> Result<()> {
     let mut nonce = [0u8; CRYPT_NONCE_LEN];
     let mut plaintext_buffer = Cursor::new(Vec::new());
@@ -55,7 +54,6 @@ pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
             &mut plaintext_buffer,
             &mut nonce,
             &message,
-            do_encryption,
         )
         .await?;
     }

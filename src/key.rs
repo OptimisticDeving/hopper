@@ -79,7 +79,8 @@ impl VerifierAndEncipherer {
         server_nonce: u64,
         client_public_key: &PublicKey,
         server_public_key: &PublicKey,
-    ) -> Result<XChaCha20Poly1305> {
+        do_encryption: bool,
+    ) -> Result<Option<XChaCha20Poly1305>> {
         let message = Self::create_message(
             client_nonce,
             server_nonce,
@@ -88,16 +89,17 @@ impl VerifierAndEncipherer {
         );
 
         self.their_ed25519.verify_strict(&message, &signature)?;
-        Ok(XChaCha20Poly1305::new(
-            our_secret
-                .diffie_hellman(if self.is_client {
-                    server_public_key
-                } else {
-                    client_public_key
-                })
-                .as_bytes()
-                .into(),
-        ))
+        let diffie_hellman = our_secret.diffie_hellman(if self.is_client {
+            server_public_key
+        } else {
+            client_public_key
+        });
+
+        Ok(if do_encryption {
+            Some(XChaCha20Poly1305::new(diffie_hellman.as_bytes().into()))
+        } else {
+            None
+        })
     }
 
     #[inline]

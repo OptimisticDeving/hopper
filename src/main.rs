@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
                 server_nonce,
                 &client_public_key,
                 &server_public_key,
+                config.do_encryption,
             )?;
 
             let (message_sender, message_receiver) = unbounded_channel();
@@ -119,20 +120,12 @@ async fn main() -> Result<()> {
                 writer,
                 message_receiver,
                 cipher.clone(),
-                config.do_encryption,
             ));
 
             let nonce_to_connection = Arc::new(RwLock::new(FxHashMap::default()));
             let mut ciphertext_buffer = Cursor::new(Vec::new());
             loop {
-                match read_enciphered_message(
-                    &mut reader,
-                    &mut ciphertext_buffer,
-                    &cipher,
-                    config.do_encryption,
-                )
-                .await?
-                {
+                match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
                     Message::AddNonce(nonce) => {
                         let stream =
                             match TcpStream::connect(config.tcp_server_address.as_ref()).await {

@@ -27,10 +27,9 @@ pub async fn read_public_key_and_nonce<R: AsyncRead + Unpin>(
 pub async fn read_enciphered_message<R: AsyncRead + Unpin>(
     mut reader: R,
     mut ciphertext_buffer: &mut Cursor<Vec<u8>>,
-    cipher: &XChaCha20Poly1305,
-    do_encryption: bool,
+    cipher: &Option<XChaCha20Poly1305>,
 ) -> Result<Message> {
-    if do_encryption {
+    if let Some(cipher) = cipher {
         ciphertext_buffer.set_position(0);
 
         let crypt_nonce = read_exact::<CRYPT_NONCE_LEN, _>(&mut reader).await?;
@@ -56,13 +55,12 @@ pub async fn read_enciphered_message<R: AsyncRead + Unpin>(
 #[inline]
 pub async fn write_packet<W: AsyncWrite + Unpin>(
     mut writer: W,
-    cipher: &XChaCha20Poly1305,
+    cipher: &Option<XChaCha20Poly1305>,
     mut plaintext_buffer: &mut Cursor<Vec<u8>>,
     nonce_buffer: &mut [u8; CRYPT_NONCE_LEN],
     message: &Message,
-    do_encryption: bool,
 ) -> Result<()> {
-    if do_encryption {
+    if let Some(cipher) = cipher {
         plaintext_buffer.set_position(0);
         message.write(&mut plaintext_buffer).await?;
 
