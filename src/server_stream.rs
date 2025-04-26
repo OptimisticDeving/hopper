@@ -143,88 +143,114 @@ pub async fn start_proxying_parent(
     mut event_receiver: UnboundedReceiver<ServerConnectionEvent>,
     verifier: VerifierAndEncipherer,
     do_encryption: bool,
+    max_processing_consolidation: usize,
 ) -> Result<()> {
     let true_stream: Arc<Mutex<Option<TrueStream>>> = Arc::new(Mutex::new(None));
     let nonce_to_sender = Arc::new(RwLock::new(FxHashMap::default()));
     let verifier = Arc::new(verifier);
     let mut nonce_buffer = [0u8; CRYPT_NONCE_LEN];
     let mut plaintext_buffer = Cursor::new(Vec::new());
+    let mut message_buffer = Vec::new();
 
-    while let Some(event) = event_receiver.recv().await {
+    loop {
+        message_buffer.clear();
+
+        let received_messages = event_receiver
+            .recv_many(&mut message_buffer, max_processing_consolidation)
+            .await;
+
+        if received_messages == 0 {
+            return Ok(());
+        }
+
         let mut true_stream_lock = true_stream.lock().await;
-        let (true_stream, message) = match (true_stream_lock.as_mut(), event) {
-            (
-                Some(true_stream),
-                ServerConnectionEvent::CreateNonce {
-                    nonce,
-                    incoming_sender,
-                },
-            ) => {
-                nonce_to_sender.write().await.insert(nonce, incoming_sender);
 
-                (true_stream, Message::AddNonce(nonce))
-            }
-            (Some(true_stream), ServerConnectionEvent::RemoveNonce(nonce)) => {
-                (true_stream, Message::RemoveNonce(nonce))
-            }
-            (Some(true_stream), ServerConnectionEvent::SendData { nonce, data }) => {
-                (true_stream, Message::Message { nonce, data })
-            }
-            (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
-                info!("new true stream request");
+        for event in message_buffer.drain(..received_messages) {
+            let (true_stream, message) = match (true_stream_lock.as_mut(), event) {
+                (
+                    Some(true_stream),
+                    ServerConnectionEvent::CreateNonce {
+                        nonce,
+                        incoming_sender,
+                    },
+                ) => {
+                    nonce_to_sender.write().await.insert(nonce, incoming_sender);
 
-                let (nonce_to_sender, verifier, true_stream) = (
-                    nonce_to_sender.clone(),
-                    verifier.clone(),
-                    true_stream.clone(),
-                );
-                spawn(async move {
-                    match timeout(
-                        Duration::from_secs(15),
-                        handle_true_stream_request(
-                            reader,
-                            writer,
-                            nonce_to_sender,
-                            verifier,
-                            true_stream,
-                            do_encryption,
-                        ),
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .flatten()
-                    {
-                        Result::Ok(_) => {}
-                        Err(e) => warn!(?e, "auth failure"),
-                    }
-                });
-                continue;
+                    (true_stream, Message::AddNonce(nonce))
+                }
+                (Some(true_stream), ServerConnectionEvent::RemoveNonce(nonce)) => {
+                    (true_stream, Message::RemoveNonce(nonce))
+                }
+                (Some(true_stream), ServerConnectionEvent::SendData { nonce, data }) => {
+                    (true_stream, Message::Message { nonce, data })
+                }
+                (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
+                    info!("new true stream request");
+
+                    let (nonce_to_sender, verifier, true_stream) = (
+                        nonce_to_sender.clone(),
+                        verifier.clone(),
+                        true_stream.clone(),
+                    );
+                    spawn(async move {
+                        match timeout(
+                            Duration::from_secs(15),
+                            handle_true_stream_request(
+                                reader,
+                                writer,
+                                nonce_to_sender,
+                                verifier,
+                                true_stream,
+                                do_encryption,
+                            ),
+                        )
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .flatten()
+                        {
+                            Result::Ok(_) => {}
+                            Err(e) => warn!(?e, "auth failure"),
+                        }
+                    });
+                    continue;
+                }
+                (_, event) => {
+                    warn!("received event with invalid order/side: {event:?}");
+                    continue;
+                }
+            };
+
+            match write_packet(
+                &mut true_stream.writer,
+                &true_stream.cipher,
+                &mut plaintext_buffer,
+                &mut nonce_buffer,
+                &message,
+            )
+            .await
+            {
+                Result::Ok(_) => continue,
+                Err(e) => {
+                    error!(?e, "failed to write to client, state will be reset");
+                    true_stream_lock.take();
+                    nonce_to_sender.write().await.clear();
+                }
             }
-            (_, event) => {
-                warn!("received event with invalid order/side: {event:?}");
-                continue;
-            }
+        }
+
+        let Some(true_stream) = true_stream_lock.as_mut() else {
+            continue;
         };
 
-        match write_packet(
-            &mut true_stream.writer,
-            &true_stream.cipher,
-            &mut plaintext_buffer,
-            &mut nonce_buffer,
-            &message,
-        )
-        .await
-        {
+        match true_stream.writer.flush().await {
             Result::Ok(_) => continue,
             Err(e) => {
-                error!(?e, "failed to write to client, state will be reset");
+                error!(?e, "failed to flush client, state will be reset");
                 true_stream_lock.take();
                 nonce_to_sender.write().await.clear();
             }
-        }
+        };
     }
-
-    Ok(())
 }
 
 #[inline]
@@ -258,6 +284,7 @@ async fn start_proxying_child<R: AsyncRead + Unpin + Send + 'static, W: AsyncWri
     event_sender: UnboundedSender<ServerConnectionEvent>,
     packet_length: usize,
     packet_id: i32,
+    max_processing_consolidation: usize,
 ) -> Result<()> {
     if packet_length > 65535 {
         bail!("Client sent oversized initial packet");
@@ -308,22 +335,29 @@ async fn start_proxying_child<R: AsyncRead + Unpin + Send + 'static, W: AsyncWri
     });
 
     let res: Result<Infallible> = async {
+        let mut packet_buffer = Vec::new();
+
         loop {
-            let body = select! {
-                body = incoming_receiver.recv() => {
-                    body
+            packet_buffer.clear();
+
+            let received_packets = select! {
+                received_packets = incoming_receiver.recv_many(&mut packet_buffer, max_processing_consolidation) => {
+                    received_packets
                 },
                 _ = death_receiver.recv() => {
-                    None
+                    0
                 }
             };
 
-            let Some(body) = body else {
-                bail!("incoming packet sender dropped/death sent")
-            };
+            if received_packets == 0 {
+                bail!("incoming packet sender dropped/death sent");
+            }
 
-            write_var_int(&mut writer, body.len().try_into()?).await?;
-            writer.write_all(&body).await?;
+            for body in &packet_buffer[..received_packets] {
+                write_var_int(&mut writer, body.len().try_into()?).await?;
+                writer.write_all(&body).await?;
+            }
+
             writer.flush().await?;
         }
     }
@@ -341,6 +375,7 @@ async fn start_proxying_child<R: AsyncRead + Unpin + Send + 'static, W: AsyncWri
 pub async fn handle_initial_connection(
     stream: TcpStream,
     event_sender: UnboundedSender<ServerConnectionEvent>,
+    max_processing_consolidation: usize,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
 
@@ -359,6 +394,7 @@ pub async fn handle_initial_connection(
             event_sender,
             usize::try_from(packet_length)?.saturating_sub(packet_id_len),
             packet_id,
+            max_processing_consolidation,
         )
         .await?;
     } else {

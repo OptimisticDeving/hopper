@@ -43,19 +43,35 @@ pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Message>,
     cipher: Option<XChaCha20Poly1305>,
+    max_processing_consoldiation: usize,
 ) -> Result<()> {
     let mut nonce = [0u8; CRYPT_NONCE_LEN];
     let mut plaintext_buffer = Cursor::new(Vec::new());
+    let mut message_buffer = Vec::new();
 
-    while let Some(message) = receiver.recv().await {
-        write_packet(
-            &mut writer,
-            &cipher,
-            &mut plaintext_buffer,
-            &mut nonce,
-            &message,
-        )
-        .await?;
+    loop {
+        message_buffer.clear();
+
+        let received_messages = receiver
+            .recv_many(&mut message_buffer, max_processing_consoldiation)
+            .await;
+
+        if received_messages == 0 {
+            break;
+        }
+
+        for message in &message_buffer[..received_messages] {
+            write_packet(
+                &mut writer,
+                &cipher,
+                &mut plaintext_buffer,
+                &mut nonce,
+                message,
+            )
+            .await?;
+        }
+
+        writer.flush().await?;
     }
 
     Ok(())
@@ -103,12 +119,26 @@ pub async fn handle_mc_proxy_read<R: AsyncRead + Unpin>(
 pub async fn handle_write<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Vec<u8>>,
+    max_processing_consoldiation: usize,
 ) -> Result<()> {
-    while let Some(body) = receiver.recv().await {
-        write_var_int(&mut writer, body.len().try_into()?).await?;
-        writer.write_all(&body).await?;
+    let mut packet_buffer = Vec::new();
+
+    loop {
+        packet_buffer.clear();
+
+        let received_packets = receiver
+            .recv_many(&mut packet_buffer, max_processing_consoldiation)
+            .await;
+
+        if received_packets == 0 {
+            return Ok(());
+        }
+
+        for body in &packet_buffer[..received_packets] {
+            write_var_int(&mut writer, body.len().try_into()?).await?;
+            writer.write_all(body).await?;
+        }
+
         writer.flush().await?;
     }
-
-    Ok(())
 }

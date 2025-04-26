@@ -13,6 +13,7 @@ Minecraft reverse proxy intended for servers with encryption disabled.
 |SERVER_PRIVATE_KEY_PATH|Path|./server.key|Path of the server private key|
 |SERVER_PUBLIC_KEY_PATH|Path|./server.pub|Path of the server public key|
 |DO_ENCRYPTION|Boolean (true/false)|true|Toggle encryption for true client/false server communication|
+|MAX_PROCESSING_CONSOLIDATION|usize|usize::MAX|(experimental, this may be wrong!) Maximum amount of events we can receive in bulk. This affects all proxy messages and outbound minecraft packets. Using a lower value may slightly decrease latency, but is likely to decrease performance with a high amount of data transfer| 
 
 ## Usage
 

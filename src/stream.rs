@@ -79,8 +79,6 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
         message.write(&mut writer).await?;
     }
 
-    writer.flush().await?;
-
     Ok(())
 }
 

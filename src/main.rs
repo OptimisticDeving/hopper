@@ -49,6 +49,7 @@ struct Config {
     pub server_private_key_path: Cow<'static, str>,
     pub server_public_key_path: Cow<'static, str>,
     pub do_encryption: bool,
+    pub max_processing_consolidation: usize,
 }
 
 impl Default for Config {
@@ -61,6 +62,7 @@ impl Default for Config {
             server_private_key_path: Cow::Borrowed("./server.key"),
             server_public_key_path: Cow::Borrowed("./server.pub"),
             do_encryption: true,
+            max_processing_consolidation: usize::MAX,
         }
     }
 }
@@ -137,6 +139,7 @@ async fn main() -> Result<()> {
                 writer,
                 message_receiver,
                 cipher.clone(),
+                config.max_processing_consolidation,
             ));
 
             let nonce_to_connection = Arc::new(RwLock::new(FxHashMap::default()));
@@ -173,7 +176,11 @@ async fn main() -> Result<()> {
                             stream.set_nodelay(true)?;
                             let (reader, writer) = split_stream_into_buffered(stream);
                             let (write_sender, write_receiver) = unbounded_channel();
-                            spawn(handle_write(writer, write_receiver));
+                            spawn(handle_write(
+                                writer,
+                                write_receiver,
+                                config.max_processing_consolidation,
+                            ));
 
                             nonce_to_connection.write().await.insert(
                                 nonce,
@@ -226,6 +233,7 @@ async fn main() -> Result<()> {
                 event_receiver,
                 verifier,
                 config.do_encryption,
+                config.max_processing_consolidation,
             ));
 
             loop {
@@ -243,7 +251,11 @@ async fn main() -> Result<()> {
 
                 match event {
                     ServerWakeEvent::Connection((stream, _)) => {
-                        spawn(handle_initial_connection(stream, event_sender.clone()));
+                        spawn(handle_initial_connection(
+                            stream,
+                            event_sender.clone(),
+                            config.max_processing_consolidation,
+                        ));
                     }
                     ServerWakeEvent::Terminate => {
                         info!("received termination signal");
