@@ -436,17 +436,19 @@ pub async fn start_proxying_parent(
             };
 
             let nonce_to_true_stream_writer = nonce_to_true_stream_sender.read().await;
-            let Some(nonce_to_associated_writer) = nonce_to_true_stream_writer.get(&nonce) else {
+            let Some(writer) = nonce_to_true_stream_writer.get(&nonce) else {
                 warn!("no associated writer for {nonce}");
                 continue;
             };
 
-            match nonce_to_associated_writer.send(message) {
+            match writer.send(message) {
                 Result::Ok(_) => continue,
                 Err(e) => {
                     error!(?e, "failed to write to client, state will be reset");
                     true_stream_lock.take();
                     nonce_to_mc_sender.write().await.clear();
+                    drop(nonce_to_true_stream_writer);
+                    nonce_to_true_stream_sender.write().await.clear();
                 }
             }
         }
