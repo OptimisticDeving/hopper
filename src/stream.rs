@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{collections::VecDeque, io::Cursor};
 
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{XChaCha20Poly1305, aead::Aead};
@@ -10,7 +10,7 @@ use x25519_dalek::PublicKey;
 use crate::{
     key::CRYPT_NONCE_LEN,
     msg::Message,
-    util::{read_exact, read_var_int, write_var_int},
+    util::{read_exact, read_var_int, write_var_int, xor_slice},
 };
 
 #[inline]
@@ -83,6 +83,34 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
 }
 
 #[inline]
+pub async fn anon_write<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    cipher: &Option<XChaCha20Poly1305>,
+    data: &[u8],
+) -> Result<()> {
+    if let Some(cipher) = cipher {
+        let mut nonce = [0u8; CRYPT_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+
+        writer.write_all(&nonce).await?;
+        writer
+            .write_all(
+                cipher
+                    .encrypt(&nonce.into(), data)
+                    .map_err(|e| anyhow!("{e}"))?
+                    .as_ref(),
+            )
+            .await?;
+    } else {
+        writer.write_all(data).await?;
+    }
+
+    writer.flush().await?;
+
+    Ok(())
+}
+
+#[inline]
 pub async fn write_public_key_and_nonce<W: AsyncWrite + Unpin>(
     mut writer: W,
     public_key: &PublicKey,
@@ -92,4 +120,45 @@ pub async fn write_public_key_and_nonce<W: AsyncWrite + Unpin>(
     let nonce: u64 = OsRng.sample(Standard);
     writer.write_all(&nonce.to_be_bytes()).await?;
     Ok(nonce)
+}
+
+#[inline]
+pub fn select_first_from_deque_appending_to_back_mapped<E, F: Fn(&E) -> &T, T: Clone>(
+    mapper: F,
+    deque: &mut VecDeque<E>,
+) -> T {
+    if deque.len() == 1 {
+        mapper(&deque[0]).clone()
+    } else {
+        let front = deque.pop_front().unwrap();
+        let mapped_front = mapper(&front);
+        let clone = mapped_front.clone();
+        deque.push_back(front);
+        clone
+    }
+}
+
+#[inline]
+pub fn select_first_from_deque_appending_to_back_passthrough<T: Clone>(
+    deque: &mut VecDeque<T>,
+) -> T {
+    select_first_from_deque_appending_to_back_mapped(|t| t, deque)
+}
+
+pub struct CryptCombination {
+    pub combined_nonces: u64,
+    pub combined_public_keys: [u8; 32],
+}
+
+#[inline]
+pub fn combine_crypt(
+    client_nonce: u64,
+    server_nonce: u64,
+    client_public_key: &PublicKey,
+    server_public_key: &PublicKey,
+) -> CryptCombination {
+    CryptCombination {
+        combined_nonces: client_nonce ^ server_nonce,
+        combined_public_keys: xor_slice(client_public_key.to_bytes(), server_public_key.to_bytes()),
+    }
 }

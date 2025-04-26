@@ -13,7 +13,9 @@ Minecraft reverse proxy intended for servers with encryption disabled.
 |SERVER_PRIVATE_KEY_PATH|Path|./server.key|Path of the server private key|
 |SERVER_PUBLIC_KEY_PATH|Path|./server.pub|Path of the server public key|
 |DO_ENCRYPTION|Boolean (true/false)|true|Toggle encryption for true client/false server communication|
-|MAX_PROCESSING_CONSOLIDATION|usize|usize::MAX|(experimental, this may be wrong!) Maximum amount of events we can receive in bulk. This affects all proxy messages and outbound minecraft packets. Using a lower value may slightly decrease latency, but is likely to decrease performance with a high amount of data transfer| 
+|MAX_PROCESSING_CONSOLIDATION|usize|usize::MAX|(experimental, this may be wrong!) Maximum amount of events we can receive in bulk. This affects all proxy messages and outbound minecraft packets. Using a value of 1 may slightly decrease latency, but is likely to decrease performance with a high amount of data transfer| 
+|FORK_COUNT|usize|15|How many additional (fork) connections to spawn. Note that there will *always* be at least one connection spawned, so in truth FORK_COUNT + 1 connections will be used for data transfer. Note that this needs to be the same on both the client and server otherwise you will run into deserialization issues|
+|FORK_ESTABLISH_INTERVAL|u64|10|How many milliseconds to wait before establishing a new fork connection on startup|
 
 ## Usage
 
@@ -32,24 +34,3 @@ Minecraft reverse proxy intended for servers with encryption disabled.
 ### 6. Start the server
 
 ### 7. Start the client
-
-## How it works
-
-### True Client Establishment
-1. Server binds on TCP_SERVER_ADDRESS
-2. Client connects to server specified by PROXY_SERVER_ADDRESS
-3. Client sends a packet with ID 0xDEADBEEF (but signed), with the body being a random X25519 public key and a random nonce.
-4. Server sends its nonce, along with an Ed25519 signature of both the client & server X25519 public keys and both the client and server nonces.
-5. Client sends a signature of the same data.
-6. Both the client & server verify the signatures. If verification fails, the verifying party will disconnect.
-7. After this point, we will be conversing using our simpler packet format instead of the Minecraft one.
-8. If the key exchange is successful, this connection becomes the "true client" and all other previously connected clients are disconnected (incl. the previous true client), and further packets will be encrypted with XChaCha20Poly1305.
-
-### False Client Establishment
-
-1. Regular Minecraft client connects to the hopper server and sends a handshake. We differentiate between a true client establishment attempt and false client establishment attempt based on the id of this first packet.
-2. Hopper server generates a random `u32`. This will be the identifier of the connection, referred to internally as a `nonce`. Note that at no point is the hopper client made aware of the true IP address. This is intentional design.
-3. Hopper server tells the true client about this new connection nonce and the true client will open a new tcp connection to the true server.
-4. Hopper server sends the body of the handshake packet, and will keep doing so for other packets until either side of the connection dies. The true client will do the same.
-
-When a connection is closed on the side of the hopper server, the hopper server informs the true client that the connection has ended by telling it to remove the nonce.

@@ -91,3 +91,12 @@ pub fn split_stream_into_buffered(
 
     (BufReader::new(reader), BufWriter::new(writer))
 }
+
+#[inline]
+pub fn xor_slice<const N: usize>(mut first_slice: [u8; N], second_slice: [u8; N]) -> [u8; N] {
+    for idx in 0..N {
+        first_slice[idx] ^= second_slice[idx];
+    }
+
+    first_slice
+}

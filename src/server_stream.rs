@@ -1,9 +1,10 @@
-use std::{convert::Infallible, io::Cursor, sync::Arc, time::Duration};
+use std::{collections::VecDeque, convert::Infallible, io::Cursor, sync::Arc, time::Duration};
 
-use anyhow::{Ok, Result, bail};
-use chacha20poly1305::XChaCha20Poly1305;
+use anyhow::{Ok, Result, anyhow, bail};
+use chacha20poly1305::{XChaCha20Poly1305, aead::Aead};
+use ed25519_dalek::SIGNATURE_LENGTH;
 use rand::{Rng, distributions::Standard, rngs::OsRng, thread_rng};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, copy},
     net::{
@@ -23,16 +24,17 @@ use tracing::{error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
-    SPECIAL_PACKET_ID,
+    FORK_STREAM_PACKET_ID, TRUE_STREAM_PACKET_ID,
     key::{CRYPT_NONCE_LEN, VerifierAndEncipherer},
     msg::Message,
     stream::{
-        read_enciphered_message, read_public_key_and_nonce, write_packet,
+        CryptCombination, anon_write, combine_crypt, read_enciphered_message,
+        read_public_key_and_nonce, select_first_from_deque_appending_to_back_mapped, write_packet,
         write_public_key_and_nonce,
     },
     util::{
-        read_signature, read_var_int, read_var_int_with_len, split_stream_into_buffered,
-        write_var_int,
+        read_exact, read_signature, read_var_int, read_var_int_with_len,
+        split_stream_into_buffered, write_var_int,
     },
 };
 
@@ -47,7 +49,11 @@ pub enum ServerConnectionEvent {
         nonce: u32,
         data: Vec<u8>,
     },
-    ReplaceTrueStream {
+    AttemptTrueStreamReplacement {
+        reader: BufReader<OwnedReadHalf>,
+        writer: BufWriter<OwnedWriteHalf>,
+    },
+    AttemptForkStream {
         reader: BufReader<OwnedReadHalf>,
         writer: BufWriter<OwnedWriteHalf>,
     },
@@ -56,7 +62,8 @@ pub enum ServerConnectionEvent {
 #[inline]
 async fn read_from_parent(
     mut reader: BufReader<OwnedReadHalf>,
-    nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    nonce_to_mc_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    nonce_to_true_stream_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Message>>>>,
     cipher: Option<XChaCha20Poly1305>,
 ) -> Result<Infallible> {
     let mut ciphertext_buffer = Cursor::new(Vec::new());
@@ -64,17 +71,19 @@ async fn read_from_parent(
     loop {
         match read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await? {
             Message::RemoveNonce(nonce) => {
-                nonce_to_sender.write().await.remove(&nonce);
+                info!("removing nonce {nonce}");
+                nonce_to_mc_sender.write().await.remove(&nonce);
+                nonce_to_true_stream_sender.write().await.remove(&nonce);
             }
             Message::Message { nonce, data } => {
-                let map = nonce_to_sender.read().await;
+                let map = nonce_to_mc_sender.read().await;
                 let Some(sender) = map.get(&nonce) else {
                     continue;
                 };
 
                 if sender.send(data).is_err() {
                     drop(map);
-                    nonce_to_sender.write().await.remove(&nonce);
+                    nonce_to_mc_sender.write().await.remove(&nonce);
                 }
             }
             _ => continue,
@@ -82,60 +91,238 @@ async fn read_from_parent(
     }
 }
 
-pub struct TrueStream {
+#[inline]
+async fn write_to_parent(
+    mut writer: BufWriter<OwnedWriteHalf>,
+    mut message_receiver: UnboundedReceiver<Message>,
+    cipher: Option<XChaCha20Poly1305>,
+    max_processing_consolidation: usize,
+) -> Result<()> {
+    let mut packet_buffer = Vec::new();
+    let mut plaintext_buffer = Cursor::new(Vec::new());
+    let mut nonce_buffer = [0u8; CRYPT_NONCE_LEN];
+
+    loop {
+        packet_buffer.clear();
+
+        let received_messages = message_receiver
+            .recv_many(&mut packet_buffer, max_processing_consolidation)
+            .await;
+
+        if received_messages == 0 {
+            return Ok(());
+        }
+
+        for message in &packet_buffer[..received_messages] {
+            write_packet(
+                &mut writer,
+                &cipher,
+                &mut plaintext_buffer,
+                &mut nonce_buffer,
+                message,
+            )
+            .await?;
+        }
+
+        writer.flush().await?;
+    }
+}
+
+pub struct TrueStreamFork {
     pub _reader_task_drop_guard: AbortOnDropHandle<Result<Infallible>>,
-    pub writer: BufWriter<OwnedWriteHalf>,
+    pub _writer_task_drop_guard: AbortOnDropHandle<Result<()>>,
+    pub message_sender: UnboundedSender<Message>,
+    pub nonce: u64,
+}
+
+pub struct TrueStream {
     pub cipher: Option<XChaCha20Poly1305>,
+    pub remaining_fork_nonces: FxHashSet<u64>,
+    pub combination: CryptCombination,
+    pub forks: VecDeque<TrueStreamFork>,
 }
 
 #[inline]
 async fn handle_true_stream_request(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: BufWriter<OwnedWriteHalf>,
-    nonce_to_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    nonce_to_mc_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    nonce_to_true_stream_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Message>>>>,
     verifier: Arc<VerifierAndEncipherer>,
     true_stream: Arc<Mutex<Option<TrueStream>>>,
     do_encryption: bool,
+    max_processing_consolidation: usize,
+    fork_count: usize,
 ) -> Result<()> {
-    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
+    let mut rng = OsRng;
+    let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
     let server_public_key = PublicKey::from(&ephemeral_secret);
 
-    let (client_public_key, client_timestamp) = read_public_key_and_nonce(&mut reader).await?;
-    let server_timestamp = write_public_key_and_nonce(&mut writer, &server_public_key).await?;
-    let server_signature = verifier.sign_and_verify(
-        client_timestamp,
-        server_timestamp,
+    let (client_public_key, client_nonce) = read_public_key_and_nonce(&mut reader).await?;
+    let server_nonce = write_public_key_and_nonce(&mut writer, &server_public_key).await?;
+    let server_signature = verifier.true_stream_sign(
+        client_nonce,
+        server_nonce,
         &client_public_key,
         &server_public_key,
-    )?;
+    );
     writer.write_all(&server_signature.to_bytes()).await?;
     writer.flush().await?;
 
     let client_signature = read_signature(&mut reader).await?;
 
-    let cipher = verifier.peer_verify(
+    let cipher = verifier.true_stream_peer_verify(
         &client_signature,
         ephemeral_secret,
-        client_timestamp,
-        server_timestamp,
+        client_nonce,
+        server_nonce,
         &client_public_key,
         &server_public_key,
         do_encryption,
     )?;
 
+    let mut remaining_fork_nonces = FxHashSet::with_capacity_and_hasher(fork_count, FxBuildHasher);
+    let mut fork_nonce_body = Cursor::new(Vec::new());
+
+    for _ in 0..fork_count {
+        let fork_nonce: u64 = rng.r#gen();
+        remaining_fork_nonces.insert(fork_nonce);
+        fork_nonce_body.write_u64(fork_nonce).await?;
+    }
+
+    anon_write(
+        &mut writer,
+        &cipher,
+        &fork_nonce_body.get_ref()[..fork_nonce_body.position() as usize],
+    )
+    .await?;
+
     info!("auth success, we have a new true stream!");
-    nonce_to_sender.write().await.clear();
+    nonce_to_mc_sender.write().await.clear();
+    nonce_to_true_stream_sender.write().await.clear();
+
+    let (message_sender, message_receiver) = unbounded_channel();
+
     *true_stream.lock().await = Some(TrueStream {
-        _reader_task_drop_guard: AbortOnDropHandle::new(spawn(read_from_parent(
-            reader,
-            nonce_to_sender.clone(),
-            cipher.clone(),
-        ))),
-        writer,
-        cipher,
+        cipher: cipher.clone(),
+        remaining_fork_nonces,
+        combination: combine_crypt(
+            client_nonce,
+            server_nonce,
+            &client_public_key,
+            &server_public_key,
+        ),
+        forks: VecDeque::from([TrueStreamFork {
+            _reader_task_drop_guard: AbortOnDropHandle::new(spawn(read_from_parent(
+                reader,
+                nonce_to_mc_sender,
+                nonce_to_true_stream_sender,
+                cipher.clone(),
+            ))),
+            _writer_task_drop_guard: AbortOnDropHandle::new(spawn(write_to_parent(
+                writer,
+                message_receiver,
+                cipher,
+                max_processing_consolidation,
+            ))),
+            message_sender,
+            nonce: 0,
+        }]),
     });
 
     Ok(())
+}
+
+#[inline]
+async fn handle_fork_stream_request(
+    mut reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
+    nonce_to_mc_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Vec<u8>>>>>,
+    nonce_to_true_stream_sender: Arc<RwLock<FxHashMap<u32, UnboundedSender<Message>>>>,
+    verifier: Arc<VerifierAndEncipherer>,
+    true_stream: Arc<Mutex<Option<TrueStream>>>,
+    original_combined_nonce: u64,
+    original_cipher: Option<XChaCha20Poly1305>,
+    max_processing_consolidation: usize,
+) -> Result<()> {
+    let (fork_nonce, stream_nonce, signature) = if let Some(cipher) = original_cipher {
+        let cipher_nonce = read_exact(&mut reader).await?;
+        let mut ciphertext = [0u8; (8 * 2) + SIGNATURE_LENGTH + 16];
+        reader.read_exact(&mut ciphertext).await?;
+
+        let mut reader = Cursor::new(
+            cipher
+                .decrypt(&cipher_nonce.into(), ciphertext.as_slice())
+                .map_err(|e| anyhow!("{e}"))?,
+        );
+
+        (
+            reader.read_u64().await?,
+            reader.read_u64().await?,
+            read_signature(&mut reader).await?,
+        )
+    } else {
+        (
+            reader.read_u64().await?,
+            reader.read_u64().await?,
+            read_signature(&mut reader).await?,
+        )
+    };
+
+    let mut true_stream_lock = true_stream.lock().await;
+    let true_stream = true_stream_lock.as_mut().unwrap();
+
+    if true_stream.combination.combined_nonces != original_combined_nonce {
+        bail!("mismatched combined nonces");
+    }
+
+    // don't remove it here so that real fork nonce attempts can't be interfered with
+    if !true_stream.remaining_fork_nonces.contains(&fork_nonce) {
+        bail!("unknown fork nonce");
+    }
+
+    verifier.fork_stream_verify(
+        &signature,
+        &true_stream.combination,
+        fork_nonce,
+        stream_nonce,
+    )?;
+
+    true_stream.remaining_fork_nonces.remove(&fork_nonce);
+
+    let (message_sender, message_receiver) = unbounded_channel();
+    true_stream.forks.push_front(TrueStreamFork {
+        _reader_task_drop_guard: AbortOnDropHandle::new(spawn(read_from_parent(
+            reader,
+            nonce_to_mc_sender.clone(),
+            nonce_to_true_stream_sender.clone(),
+            true_stream.cipher.clone(),
+        ))),
+        _writer_task_drop_guard: AbortOnDropHandle::new(spawn(write_to_parent(
+            writer,
+            message_receiver,
+            true_stream.cipher.clone(),
+            max_processing_consolidation,
+        ))),
+        message_sender,
+        nonce: fork_nonce,
+    });
+
+    Ok(())
+}
+
+#[inline]
+fn handle_authentication_task<F: Future<Output = Result<()>> + Send + 'static>(task: F) {
+    spawn(async move {
+        match timeout(Duration::from_secs(15), task)
+            .await
+            .map_err(anyhow::Error::new)
+            .flatten()
+        {
+            Result::Ok(_) => {}
+            Err(e) => warn!(?e, "auth task failure"),
+        }
+    });
 }
 
 #[inline]
@@ -144,12 +331,12 @@ pub async fn start_proxying_parent(
     verifier: VerifierAndEncipherer,
     do_encryption: bool,
     max_processing_consolidation: usize,
+    fork_count: usize,
 ) -> Result<()> {
     let true_stream: Arc<Mutex<Option<TrueStream>>> = Arc::new(Mutex::new(None));
-    let nonce_to_sender = Arc::new(RwLock::new(FxHashMap::default()));
+    let nonce_to_mc_sender = Arc::new(RwLock::new(FxHashMap::default()));
+    let nonce_to_true_stream_sender = Arc::new(RwLock::new(FxHashMap::default()));
     let verifier = Arc::new(verifier);
-    let mut nonce_buffer = [0u8; CRYPT_NONCE_LEN];
-    let mut plaintext_buffer = Cursor::new(Vec::new());
     let mut message_buffer = Vec::new();
 
     loop {
@@ -166,7 +353,7 @@ pub async fn start_proxying_parent(
         let mut true_stream_lock = true_stream.lock().await;
 
         for event in message_buffer.drain(..received_messages) {
-            let (true_stream, message) = match (true_stream_lock.as_mut(), event) {
+            let (nonce, message) = match (true_stream_lock.as_mut(), event) {
                 (
                     Some(true_stream),
                     ServerConnectionEvent::CreateNonce {
@@ -174,44 +361,72 @@ pub async fn start_proxying_parent(
                         incoming_sender,
                     },
                 ) => {
-                    nonce_to_sender.write().await.insert(nonce, incoming_sender);
+                    if !true_stream.remaining_fork_nonces.is_empty() {
+                        warn!("connection attempted with remaining fork nonces");
+                        continue;
+                    }
 
-                    (true_stream, Message::AddNonce(nonce))
+                    nonce_to_mc_sender
+                        .write()
+                        .await
+                        .insert(nonce, incoming_sender);
+
+                    let selected_sender = select_first_from_deque_appending_to_back_mapped(
+                        |fork| {
+                            info!("selecting fork #{}", fork.nonce);
+                            &fork.message_sender
+                        },
+                        &mut true_stream.forks,
+                    );
+
+                    nonce_to_true_stream_sender
+                        .write()
+                        .await
+                        .insert(nonce, selected_sender);
+
+                    (nonce, Message::AddNonce(nonce))
                 }
-                (Some(true_stream), ServerConnectionEvent::RemoveNonce(nonce)) => {
-                    (true_stream, Message::RemoveNonce(nonce))
+                (Some(_), ServerConnectionEvent::RemoveNonce(nonce)) => {
+                    (nonce, Message::RemoveNonce(nonce))
                 }
-                (Some(true_stream), ServerConnectionEvent::SendData { nonce, data }) => {
-                    (true_stream, Message::Message { nonce, data })
+                (Some(_), ServerConnectionEvent::SendData { nonce, data }) => {
+                    (nonce, Message::Message { nonce, data })
                 }
-                (Some(_) | None, ServerConnectionEvent::ReplaceTrueStream { reader, writer }) => {
+                (_, ServerConnectionEvent::AttemptTrueStreamReplacement { reader, writer }) => {
                     info!("new true stream request");
 
-                    let (nonce_to_sender, verifier, true_stream) = (
-                        nonce_to_sender.clone(),
+                    handle_authentication_task(handle_true_stream_request(
+                        reader,
+                        writer,
+                        nonce_to_mc_sender.clone(),
+                        nonce_to_true_stream_sender.clone(),
                         verifier.clone(),
                         true_stream.clone(),
-                    );
-                    spawn(async move {
-                        match timeout(
-                            Duration::from_secs(15),
-                            handle_true_stream_request(
-                                reader,
-                                writer,
-                                nonce_to_sender,
-                                verifier,
-                                true_stream,
-                                do_encryption,
-                            ),
-                        )
-                        .await
-                        .map_err(anyhow::Error::new)
-                        .flatten()
-                        {
-                            Result::Ok(_) => {}
-                            Err(e) => warn!(?e, "auth failure"),
-                        }
-                    });
+                        do_encryption,
+                        max_processing_consolidation,
+                        fork_count,
+                    ));
+
+                    continue;
+                }
+                (
+                    Some(true_stream_ref),
+                    ServerConnectionEvent::AttemptForkStream { reader, writer },
+                ) => {
+                    info!("new fork stream request");
+
+                    handle_authentication_task(handle_fork_stream_request(
+                        reader,
+                        writer,
+                        nonce_to_mc_sender.clone(),
+                        nonce_to_true_stream_sender.clone(),
+                        verifier.clone(),
+                        true_stream.clone(),
+                        true_stream_ref.combination.combined_nonces,
+                        true_stream_ref.cipher.clone(),
+                        max_processing_consolidation,
+                    ));
+
                     continue;
                 }
                 (_, event) => {
@@ -220,36 +435,21 @@ pub async fn start_proxying_parent(
                 }
             };
 
-            match write_packet(
-                &mut true_stream.writer,
-                &true_stream.cipher,
-                &mut plaintext_buffer,
-                &mut nonce_buffer,
-                &message,
-            )
-            .await
-            {
+            let nonce_to_true_stream_writer = nonce_to_true_stream_sender.read().await;
+            let Some(nonce_to_associated_writer) = nonce_to_true_stream_writer.get(&nonce) else {
+                warn!("no associated writer for {nonce}");
+                continue;
+            };
+
+            match nonce_to_associated_writer.send(message) {
                 Result::Ok(_) => continue,
                 Err(e) => {
                     error!(?e, "failed to write to client, state will be reset");
                     true_stream_lock.take();
-                    nonce_to_sender.write().await.clear();
+                    nonce_to_mc_sender.write().await.clear();
                 }
             }
         }
-
-        let Some(true_stream) = true_stream_lock.as_mut() else {
-            continue;
-        };
-
-        match true_stream.writer.flush().await {
-            Result::Ok(_) => continue,
-            Err(e) => {
-                error!(?e, "failed to flush client, state will be reset");
-                true_stream_lock.take();
-                nonce_to_sender.write().await.clear();
-            }
-        };
     }
 }
 
@@ -387,18 +587,23 @@ pub async fn handle_initial_connection(
     })
     .await??;
 
-    if packet_id != SPECIAL_PACKET_ID {
-        start_proxying_child(
-            reader,
-            writer,
-            event_sender,
-            usize::try_from(packet_length)?.saturating_sub(packet_id_len),
-            packet_id,
-            max_processing_consolidation,
-        )
-        .await?;
-    } else {
-        event_sender.send(ServerConnectionEvent::ReplaceTrueStream { reader, writer })?;
+    match packet_id {
+        TRUE_STREAM_PACKET_ID => event_sender
+            .send(ServerConnectionEvent::AttemptTrueStreamReplacement { reader, writer })?,
+        FORK_STREAM_PACKET_ID => {
+            event_sender.send(ServerConnectionEvent::AttemptForkStream { reader, writer })?
+        }
+        _ => {
+            start_proxying_child(
+                reader,
+                writer,
+                event_sender,
+                usize::try_from(packet_length)?.saturating_sub(packet_id_len),
+                packet_id,
+                max_processing_consolidation,
+            )
+            .await?
+        }
     }
 
     Ok(())

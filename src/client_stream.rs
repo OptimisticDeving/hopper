@@ -1,49 +1,83 @@
-use std::{convert::Infallible, io::Cursor, sync::Arc};
+use std::{collections::VecDeque, convert::Infallible, io::Cursor, sync::Arc};
 
 use anyhow::Result;
 use chacha20poly1305::XChaCha20Poly1305;
+use rand::{Rng, rngs::OsRng};
 use rustc_hash::FxHashMap;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy},
+    net::TcpStream,
+    spawn,
     sync::{
-        RwLock,
-        mpsc::{UnboundedReceiver, UnboundedSender},
+        Mutex, RwLock,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
 };
 use tokio_util::task::AbortOnDropHandle;
-use tracing::info;
+use tracing::{info, warn};
 use x25519_dalek::PublicKey;
 
 use crate::{
-    SPECIAL_PACKET_ID,
-    key::CRYPT_NONCE_LEN,
+    FORK_STREAM_PACKET_ID, TRUE_STREAM_PACKET_ID,
+    key::{CRYPT_NONCE_LEN, VerifierAndEncipherer},
     msg::Message,
-    stream::{write_packet, write_public_key_and_nonce},
-    util::{read_var_int, write_var_int},
+    stream::{
+        CryptCombination, anon_write, read_enciphered_message,
+        select_first_from_deque_appending_to_back_passthrough, write_packet,
+        write_public_key_and_nonce,
+    },
+    util::{read_var_int, split_stream_into_buffered, write_var_int},
 };
 
 #[inline]
-pub async fn send_special_packet<W: AsyncWrite + Unpin>(
+pub async fn send_true_stream_init_packet<W: AsyncWrite + Unpin>(
     mut writer: W,
     public_key: &PublicKey,
 ) -> Result<u64> {
-    let mut body = Vec::new();
-    write_var_int(&mut body, SPECIAL_PACKET_ID).await?;
-    let timestamp = write_public_key_and_nonce(&mut body, public_key).await?;
-
-    write_var_int(&mut writer, body.len().try_into()?).await?;
-    copy(&mut Cursor::new(&mut body), &mut writer).await?;
+    writer.write_u8(0).await?; // we don't need the length
+    write_var_int(&mut writer, TRUE_STREAM_PACKET_ID).await?;
+    let nonce = write_public_key_and_nonce(&mut writer, public_key).await?;
     writer.flush().await?;
 
-    Ok(timestamp)
+    Ok(nonce)
 }
 
 #[inline]
-pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
+pub async fn send_fork_stream_init_packet<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    fork_nonce: u64,
+    verifier: &VerifierAndEncipherer,
+    combination: &CryptCombination,
+    cipher: &Option<XChaCha20Poly1305>,
+) -> Result<()> {
+    writer.write_u8(0).await?;
+    write_var_int(&mut writer, FORK_STREAM_PACKET_ID).await?;
+
+    let mut rng = OsRng;
+    let stream_nonce: u64 = rng.r#gen();
+
+    let mut body = Cursor::new(Vec::new());
+    body.write_u64(fork_nonce).await?;
+    body.write_u64(stream_nonce).await?;
+    let signature = verifier.fork_stream_sign(combination, fork_nonce, stream_nonce);
+    body.write_all(&signature.to_bytes()).await?;
+
+    anon_write(
+        &mut writer,
+        cipher,
+        &body.get_ref()[..body.position() as usize],
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[inline]
+pub async fn handle_fork_write<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Message>,
     cipher: Option<XChaCha20Poly1305>,
-    max_processing_consoldiation: usize,
+    max_processing_consolidation: usize,
 ) -> Result<()> {
     let mut nonce = [0u8; CRYPT_NONCE_LEN];
     let mut plaintext_buffer = Cursor::new(Vec::new());
@@ -53,7 +87,7 @@ pub async fn start_writing_messages<W: AsyncWrite + Unpin>(
         message_buffer.clear();
 
         let received_messages = receiver
-            .recv_many(&mut message_buffer, max_processing_consoldiation)
+            .recv_many(&mut message_buffer, max_processing_consolidation)
             .await;
 
         if received_messages == 0 {
@@ -98,13 +132,11 @@ async fn handle_read<R: AsyncRead + Unpin>(
 }
 
 #[inline]
-pub async fn handle_mc_proxy_read<R: AsyncRead + Unpin>(
+pub async fn handle_mc_proxy_read<R: AsyncRead + Unpin, V>(
     reader: R,
     nonce: u32,
     message_sender: UnboundedSender<Message>,
-    nonce_to_conn_map: Arc<
-        RwLock<FxHashMap<u32, (AbortOnDropHandle<Result<()>>, UnboundedSender<Vec<u8>>)>>,
-    >,
+    nonce_to_conn_map: Arc<RwLock<FxHashMap<u32, V>>>,
 ) -> Result<()> {
     info!(
         "mc half ended because {:?}",
@@ -119,7 +151,7 @@ pub async fn handle_mc_proxy_read<R: AsyncRead + Unpin>(
 pub async fn handle_write<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut receiver: UnboundedReceiver<Vec<u8>>,
-    max_processing_consoldiation: usize,
+    max_processing_consolidation: usize,
 ) -> Result<()> {
     let mut packet_buffer = Vec::new();
 
@@ -127,7 +159,7 @@ pub async fn handle_write<W: AsyncWrite + Unpin>(
         packet_buffer.clear();
 
         let received_packets = receiver
-            .recv_many(&mut packet_buffer, max_processing_consoldiation)
+            .recv_many(&mut packet_buffer, max_processing_consolidation)
             .await;
 
         if received_packets == 0 {
@@ -141,4 +173,111 @@ pub async fn handle_write<W: AsyncWrite + Unpin>(
 
         writer.flush().await?;
     }
+}
+
+pub struct ClientStream {
+    _read_drop_guard: AbortOnDropHandle<Result<()>>,
+    write_sender: UnboundedSender<Vec<u8>>,
+}
+
+#[inline]
+pub async fn handle_fork_read<R: AsyncRead + Unpin>(
+    mut reader: R,
+    cipher: Option<XChaCha20Poly1305>,
+    message_sender: UnboundedSender<Message>,
+    tcp_server_address: Arc<str>,
+    max_processing_consolidation: usize,
+    nonce_to_conn_map: Arc<RwLock<FxHashMap<u32, ClientStream>>>,
+    fork_queue: Arc<Mutex<VecDeque<UnboundedSender<Message>>>>,
+) -> Result<()> {
+    let mut ciphertext_buffer = Cursor::new(Vec::new());
+    loop {
+        let message = read_enciphered_message(&mut reader, &mut ciphertext_buffer, &cipher).await?;
+
+        match message {
+            Message::AddNonce(nonce) => {
+                let stream = match TcpStream::connect(tcp_server_address.as_ref()).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(?e, "failed to connect to the true server");
+                        message_sender.send(Message::RemoveNonce(nonce))?;
+                        continue;
+                    }
+                };
+
+                stream.set_nodelay(true)?;
+                let (reader, writer) = split_stream_into_buffered(stream);
+                let (write_sender, write_receiver) = unbounded_channel();
+                spawn(handle_write(
+                    writer,
+                    write_receiver,
+                    max_processing_consolidation,
+                ));
+
+                let message_sender = select_first_from_deque_appending_to_back_passthrough(
+                    &mut *fork_queue.lock().await,
+                );
+
+                nonce_to_conn_map.write().await.insert(
+                    nonce,
+                    ClientStream {
+                        _read_drop_guard: AbortOnDropHandle::new(spawn(handle_mc_proxy_read(
+                            reader,
+                            nonce,
+                            message_sender.clone(),
+                            nonce_to_conn_map.clone(),
+                        ))),
+                        write_sender,
+                    },
+                );
+            }
+            Message::RemoveNonce(nonce) => {
+                nonce_to_conn_map.write().await.remove(&nonce);
+            }
+            Message::Message { nonce, data } => {
+                let read = nonce_to_conn_map.read().await;
+                let Some(stream) = read.get(&nonce) else {
+                    continue;
+                };
+
+                stream.write_sender.send(data)?;
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn create_fork<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: W,
+    max_processing_consolidation: usize,
+    cipher: &Option<XChaCha20Poly1305>,
+    tcp_server_address: Arc<str>,
+    nonce_to_conn_map: Arc<RwLock<FxHashMap<u32, ClientStream>>>,
+    fork_queue: Arc<Mutex<VecDeque<UnboundedSender<Message>>>>,
+) -> (
+    UnboundedSender<Message>,
+    impl Future<Output = Result<()>> + use<R, W>,
+    impl Future<Output = Result<()>> + use<R, W>,
+) {
+    let (message_sender, message_receiver) = unbounded_channel();
+
+    (
+        message_sender.clone(),
+        handle_fork_read(
+            reader,
+            cipher.clone(),
+            message_sender,
+            tcp_server_address,
+            max_processing_consolidation,
+            nonce_to_conn_map,
+            fork_queue,
+        ),
+        handle_fork_write(
+            writer,
+            message_receiver,
+            cipher.clone(),
+            max_processing_consolidation,
+        ),
+    )
 }

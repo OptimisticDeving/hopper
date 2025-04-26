@@ -9,10 +9,11 @@ use tokio::fs::{try_exists, write};
 use tracing::info;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use crate::util::read_exact_file;
+use crate::{stream::CryptCombination, util::read_exact_file};
 
 pub const CRYPT_NONCE_LEN: usize = 24;
-pub const SIGN_MESSAGE_SIZE: usize = (8 * 2) + (32 * 2);
+pub const TRUE_STREAM_MESSAGE_SIZE: usize = (8 * 2) + (32 * 2);
+pub const FORK_STREAM_MESSAGE_SIZE: usize = (8 * 3) + 32;
 
 pub struct VerifierAndEncipherer {
     pub our_ed25519: SigningKey,
@@ -22,18 +23,34 @@ pub struct VerifierAndEncipherer {
 
 impl VerifierAndEncipherer {
     #[inline]
-    pub fn create_message(
+    pub fn true_stream_message(
         client_nonce: u64,
         server_nonce: u64,
         client_public_key: &PublicKey,
         server_public_key: &PublicKey,
-    ) -> [u8; SIGN_MESSAGE_SIZE] {
-        let mut message = [0u8; SIGN_MESSAGE_SIZE];
+    ) -> [u8; TRUE_STREAM_MESSAGE_SIZE] {
+        let mut message = [0u8; TRUE_STREAM_MESSAGE_SIZE];
 
         message[0..8].copy_from_slice(&client_nonce.to_be_bytes());
         message[8..16].copy_from_slice(&server_nonce.to_be_bytes());
         message[16..48].copy_from_slice(client_public_key.as_bytes());
         message[48..].copy_from_slice(server_public_key.as_bytes());
+
+        message
+    }
+
+    #[inline]
+    pub fn fork_stream_message(
+        combination: &CryptCombination,
+        fork_nonce: u64,
+        stream_nonce: u64,
+    ) -> [u8; FORK_STREAM_MESSAGE_SIZE] {
+        let mut message = [0u8; FORK_STREAM_MESSAGE_SIZE];
+
+        message[0..8].copy_from_slice(&combination.combined_nonces.to_be_bytes());
+        message[8..40].copy_from_slice(&combination.combined_public_keys);
+        message[40..48].copy_from_slice(&fork_nonce.to_be_bytes());
+        message[48..].copy_from_slice(&stream_nonce.to_be_bytes());
 
         message
     }
@@ -71,7 +88,13 @@ impl VerifierAndEncipherer {
     }
 
     #[inline]
-    pub fn peer_verify(
+    fn peer_verify(&self, signature: &Signature, msg: &[u8]) -> Result<()> {
+        self.their_ed25519.verify_strict(&msg, &signature)?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn true_stream_peer_verify(
         &self,
         signature: &Signature,
         our_secret: EphemeralSecret,
@@ -81,14 +104,15 @@ impl VerifierAndEncipherer {
         server_public_key: &PublicKey,
         do_encryption: bool,
     ) -> Result<Option<XChaCha20Poly1305>> {
-        let message = Self::create_message(
+        let msg = Self::true_stream_message(
             client_nonce,
             server_nonce,
             client_public_key,
             server_public_key,
         );
 
-        self.their_ed25519.verify_strict(&message, &signature)?;
+        self.peer_verify(signature, &msg)?;
+
         let diffie_hellman = our_secret.diffie_hellman(if self.is_client {
             server_public_key
         } else {
@@ -103,18 +127,51 @@ impl VerifierAndEncipherer {
     }
 
     #[inline]
-    pub fn sign_and_verify(
+    pub fn fork_stream_verify(
+        &self,
+        signature: &Signature,
+        combination: &CryptCombination,
+        fork_nonce: u64,
+        stream_nonce: u64,
+    ) -> Result<()> {
+        self.peer_verify(
+            signature,
+            &Self::fork_stream_message(combination, fork_nonce, stream_nonce),
+        )
+    }
+
+    #[inline]
+    pub fn sign(&self, msg: &[u8]) -> Signature {
+        self.our_ed25519.clone().sign(msg)
+    }
+
+    #[inline]
+    pub fn true_stream_sign(
         &self,
         client_nonce: u64,
         server_nonce: u64,
         client_public_key: &PublicKey,
         server_public_key: &PublicKey,
-    ) -> Result<Signature> {
-        Ok(self.our_ed25519.clone().sign(&Self::create_message(
+    ) -> Signature {
+        self.sign(&Self::true_stream_message(
             client_nonce,
             server_nonce,
             client_public_key,
             server_public_key,
-        )))
+        ))
+    }
+
+    #[inline]
+    pub fn fork_stream_sign(
+        &self,
+        combination: &CryptCombination,
+        fork_nonce: u64,
+        stream_nonce: u64,
+    ) -> Signature {
+        self.sign(&Self::fork_stream_message(
+            combination,
+            fork_nonce,
+            stream_nonce,
+        ))
     }
 }
