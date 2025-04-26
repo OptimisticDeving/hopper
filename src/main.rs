@@ -54,7 +54,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            tcp_server_address: Cow::Borrowed("127.0.0.1:25565"),
+            tcp_server_address: Cow::Borrowed("[::]:25565"),
             proxy_server_address: None,
             client_private_key_path: Cow::Borrowed("./client.key"),
             client_public_key_path: Cow::Borrowed("./client.pub"),
